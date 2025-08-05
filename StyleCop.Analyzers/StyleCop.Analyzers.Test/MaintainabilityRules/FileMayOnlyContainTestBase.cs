@@ -306,6 +306,63 @@ namespace StyleCop.Analyzers.Test.MaintainabilityRules
             }
         }
 
+        [Fact]
+        [WorkItem(3109, "https://github.com/DotNetAnalyzers/StyleCopAnalyzers/issues/3109")]
+        public async Task TestCodeFixRemovesUnnecessaryUsingsAsync()
+        {
+            var testCode = @"
+namespace TestNamespace
+{
+    using System;
+    using System.Collections.Generic;
+
+    public class TestClass
+    {
+        public List<string> Items { get; set; }
+    }
+
+    public class {|#0:TestClass2|}
+    {
+        public DateTime Date { get; set; }
+    }
+}
+";
+
+            var fixedCode = new[]
+            {
+        ("/0/Test0.cs", @"
+namespace TestNamespace
+{
+    using System;
+    using System.Collections.Generic;
+
+    public class TestClass
+    {
+        public List<string> Items { get; set; }
+    }
+}
+"),
+        ("TestClass2.cs", @"
+namespace TestNamespace
+{
+    using System;
+
+    public class TestClass2
+    {
+        public DateTime Date { get; set; }
+    }
+}
+"),
+            };
+
+            var expected = new[]
+            {
+        this.Diagnostic().WithLocation(0).WithArguments("not", "preceded"),
+            };
+
+            await this.VerifyCSharpFixAsync(testCode, this.GetSettings(), expected, fixedCode, CancellationToken.None).ConfigureAwait(false);
+        }
+
         protected DiagnosticResult Diagnostic()
             => new DiagnosticResult(this.Analyzer.SupportedDiagnostics.Single());
 
