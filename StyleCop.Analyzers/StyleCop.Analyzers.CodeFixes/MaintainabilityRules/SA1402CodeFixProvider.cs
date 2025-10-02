@@ -163,7 +163,56 @@ namespace StyleCop.Analyzers.MaintainabilityRules
 
                 if (unusedUsings.Count > 0)
                 {
+                    // Check for header comments that might need to be preserved
+                    var usingDirective = unusedUsings[0];
+                    var leadingTrivia = usingDirective.GetLeadingTrivia();
+                    var hasLeadingComment = leadingTrivia.Any(t =>
+                        !t.IsKind(SyntaxKind.WhitespaceTrivia) &&
+                        !t.IsKind(SyntaxKind.EndOfLineTrivia));
+                    
+
+                    // create a clean root without the unused usings but preserve the leading comment trivia list
+
+
                     var cleanedRoot = root.RemoveNodes(unusedUsings, SyntaxRemoveOptions.KeepUnbalancedDirectives);
+                    // Add back the leading trivia to the next node
+                    if (hasLeadingComment)
+                    {
+
+                        var nextNode = cleanedRoot.DescendantNodes(descendIntoTrivia: false)
+                            .OfType<UsingDirectiveSyntax>()
+                            .FirstOrDefault();
+                        if (nextNode != null)
+                        {
+                            var newLeadingTrivia = nextNode.GetLeadingTrivia().InsertRange(0, leadingTrivia);
+                            var newNextNode = nextNode.WithLeadingTrivia(newLeadingTrivia);
+                            cleanedRoot = cleanedRoot.ReplaceNode(nextNode, newNextNode);
+                        }
+                        else
+                        {
+                            // No more usings, add to the first member or end of file
+                            var firstMember = cleanedRoot.DescendantNodes(descendIntoTrivia: false)
+                                .FirstOrDefault(n => n is MemberDeclarationSyntax);
+                            if (firstMember != null)
+                            {
+                                var newLeadingTrivia = firstMember.GetLeadingTrivia().InsertRange(0, leadingTrivia);
+                                var newFirstMember = firstMember.WithLeadingTrivia(newLeadingTrivia);
+                                cleanedRoot = cleanedRoot.ReplaceNode(firstMember, newFirstMember);
+                            }
+                            else
+                            {
+                                // No members, add to the end of the file
+                                var newTrailingTrivia = cleanedRoot.GetTrailingTrivia().AddRange(leadingTrivia);
+                                cleanedRoot = cleanedRoot.WithTrailingTrivia(newTrailingTrivia);
+                            }
+                        }
+                        
+
+                    }
+                    if (cleanedRoot is CompilationUnitSyntax cuNorm)
+                    {
+                        cleanedRoot = CollapseExtraEolAfterHeaderPreserveSpacing(cuNorm);
+                    }
                     solution = solution.WithDocumentSyntaxRoot(documentId, cleanedRoot);
                 }
             }
@@ -186,20 +235,151 @@ namespace StyleCop.Analyzers.MaintainabilityRules
 
         private static bool HasRelevantTrivia(UsingDirectiveSyntax usingDirective)
         {
-            var leadingTrivia = usingDirective.GetLeadingTrivia();
-            var hasLeadingComment = leadingTrivia.Any(t =>
-                !t.IsKind(SyntaxKind.WhitespaceTrivia) &&
-                !t.IsKind(SyntaxKind.EndOfLineTrivia));
-            if (hasLeadingComment)
-            {
-                return true;
-            }
+            
 
             var trailingTrivia = usingDirective.GetTrailingTrivia();
             var hasTrailingComment = trailingTrivia.Any(t =>
                 !t.IsKind(SyntaxKind.WhitespaceTrivia) &&
                 !t.IsKind(SyntaxKind.EndOfLineTrivia));
             return hasTrailingComment;
+        }
+
+        private static SyntaxTriviaList NormalizeHeaderTrivia(SyntaxTriviaList originalTrivia)
+        {
+            var processed = new List<SyntaxTrivia>();
+
+            // Add all non-whitespace trivia
+            foreach (var trivia in originalTrivia)
+            {
+                if (!trivia.IsKind(SyntaxKind.WhitespaceTrivia) &&
+                    !trivia.IsKind(SyntaxKind.EndOfLineTrivia))
+                {
+                    processed.Add(trivia);
+                }
+            }
+
+            // Ensure exactly one newline at the end
+            if (processed.Count > 0)
+            {
+                processed.Add(SyntaxFactory.ElasticCarriageReturnLineFeed);
+            }
+
+            return SyntaxFactory.TriviaList(processed);
+        }
+
+        private static CompilationUnitSyntax CollapseExtraEolAfterHeader(CompilationUnitSyntax cu)
+        {
+            var first = cu.GetFirstToken(includeZeroWidth: true);
+            var leading = first.LeadingTrivia;
+
+            // Find the last header comment at BOF (treat contiguous whitespace/EOL after comments as part of the header block)
+            int lastComment = -1;
+            for (int i = 0; i < leading.Count; i++)
+            {
+                var k = leading[i].Kind();
+                if (k == SyntaxKind.SingleLineCommentTrivia ||
+                    k == SyntaxKind.MultiLineCommentTrivia ||
+                    k == SyntaxKind.SingleLineDocumentationCommentTrivia ||
+                    k == SyntaxKind.MultiLineDocumentationCommentTrivia)
+                {
+                    lastComment = i;
+                }
+                else if (lastComment >= 0 && !(k == SyntaxKind.WhitespaceTrivia || k == SyntaxKind.EndOfLineTrivia))
+                {
+                    // stopped being header/spacing → done scanning
+                    break;
+                }
+            }
+
+            if (lastComment < 0)
+                return cu; // no header at BOF
+
+            // Scan the whitespace/EOL run immediately after the last comment
+            int runStart = lastComment + 1;
+            int runEnd = runStart;
+            while (runEnd < leading.Count)
+            {
+                var k = leading[runEnd].Kind();
+                if (k == SyntaxKind.WhitespaceTrivia || k == SyntaxKind.EndOfLineTrivia)
+                    runEnd++;
+                else
+                    break;
+            }
+
+            // Count EOLs in that run
+            int eolCount = 0;
+            for (int i = runStart; i < runEnd; i++)
+                if (leading[i].IsKind(SyntaxKind.EndOfLineTrivia))
+                    eolCount++;
+
+            // Already exactly one newline after header → nothing to do
+            if (eolCount == 1)
+                return cu;
+
+            // Rebuild leading: keep everything through the last comment, then EXACTLY one newline
+            var newLeading = new List<SyntaxTrivia>(runStart + 1);
+            for (int i = 0; i <= lastComment; i++)
+                newLeading.Add(leading[i]);
+
+            newLeading.Add(SyntaxFactory.ElasticCarriageReturnLineFeed);
+
+            var newFirst = first.WithLeadingTrivia(SyntaxFactory.TriviaList(newLeading));
+            return cu.ReplaceToken(first, newFirst);
+        }
+
+        private static CompilationUnitSyntax CollapseExtraEolAfterHeaderPreserveSpacing(CompilationUnitSyntax cu)
+        {
+            var first = cu.GetFirstToken(includeZeroWidth: true);
+            var leading = first.LeadingTrivia;
+
+            // Find the last header comment
+            int lastComment = -1;
+            for (int i = 0; i < leading.Count; i++)
+            {
+                var k = leading[i].Kind();
+                if (k == SyntaxKind.SingleLineCommentTrivia ||
+                    k == SyntaxKind.MultiLineCommentTrivia ||
+                    k == SyntaxKind.SingleLineDocumentationCommentTrivia ||
+                    k == SyntaxKind.MultiLineDocumentationCommentTrivia)
+                {
+                    lastComment = i;
+                }
+                else if (lastComment >= 0 && !(k == SyntaxKind.WhitespaceTrivia || k == SyntaxKind.EndOfLineTrivia))
+                {
+                    break;
+                }
+            }
+
+            if (lastComment < 0)
+                return cu; // no header
+
+            // Count EOLs after the last comment
+            int runStart = lastComment + 1;
+            int eolCount = 0;
+            for (int i = runStart; i < leading.Count; i++)
+            {
+                if (leading[i].IsKind(SyntaxKind.EndOfLineTrivia))
+                    eolCount++;
+                else if (!leading[i].IsKind(SyntaxKind.WhitespaceTrivia))
+                    break;
+            }
+
+            // Allow 1-2 newlines (preserve some spacing but not excessive)
+            int targetEolCount = Math.Min(Math.Max(eolCount, 1), 2);
+            
+            if (eolCount == targetEolCount)
+                return cu; // already correct
+
+            // Rebuild with target number of newlines
+            var newLeading = new List<SyntaxTrivia>(lastComment + 1 + targetEolCount);
+            for (int i = 0; i <= lastComment; i++)
+                newLeading.Add(leading[i]);
+
+            for (int i = 0; i < targetEolCount; i++)
+                newLeading.Add(SyntaxFactory.ElasticCarriageReturnLineFeed);
+
+            var newFirst = first.WithLeadingTrivia(SyntaxFactory.TriviaList(newLeading));
+            return cu.ReplaceToken(first, newFirst);
         }
     }
 }
